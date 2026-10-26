@@ -138,6 +138,11 @@ pub struct ParakeetUnified {
     next_chunk_start_sample: usize,
     accumulated_tokens: Vec<usize>,
     accumulated_timed_tokens: Vec<TimedToken>,
+    /// Probability of each token in `accumulated_timed_tokens`: the softmax
+    /// of the joint logits at the emitted token.
+    accumulated_token_scores: Vec<f32>,
+    /// Scores of the tokens from the last `decode_encoder_frames` call.
+    pending_scores: Vec<f32>,
 }
 
 impl ParakeetUnifiedHandle {
@@ -241,6 +246,8 @@ impl ParakeetUnified {
             next_chunk_start_sample: 0,
             accumulated_tokens: Vec::new(),
             accumulated_timed_tokens: Vec::new(),
+            accumulated_token_scores: Vec::new(),
+            pending_scores: Vec::new(),
         })
     }
 
@@ -261,12 +268,20 @@ impl ParakeetUnified {
         self.next_chunk_start_sample = 0;
         self.accumulated_tokens.clear();
         self.accumulated_timed_tokens.clear();
+        self.accumulated_token_scores.clear();
     }
 
     pub fn get_timed_transcript(&self, mode: TimestampMode) -> TranscriptionResult {
         let text = self.get_transcript();
         let tokens = process_timestamps(&self.accumulated_timed_tokens, mode);
         TranscriptionResult { text, tokens }
+    }
+
+    /// Confidence of each token returned by `get_timed_transcript` in
+    /// `TimestampMode::Tokens`, in the same order: the model's probability
+    /// for the emitted token, 0 to 1.
+    pub fn token_confidences(&self) -> &[f32] {
+        &self.accumulated_token_scores
     }
 
     pub fn get_transcript(&self) -> String {
@@ -352,6 +367,8 @@ impl ParakeetUnified {
                 .extend(tokens.iter().map(|(id, _)| *id));
             self.accumulated_timed_tokens
                 .extend(self.tokens_to_timed(&tokens));
+            let scores = self.take_scores(&tokens);
+            self.accumulated_token_scores.extend(scores);
             emitted.push_str(&self.decode_incremental_tokens(&tokens));
 
             self.next_chunk_start_sample += chunk_samples;
@@ -440,6 +457,7 @@ impl ParakeetUnified {
         absolute_frame_offset: usize,
     ) -> Result<Vec<(usize, usize)>> {
         let mut tokens = Vec::new();
+        self.pending_scores.clear();
         let hidden_dim = encoder_out.shape()[1];
         let end_frame = end_frame.min(encoder_out.shape()[2]);
 
@@ -467,17 +485,20 @@ impl ParakeetUnified {
                     &self.state_2,
                 )?;
 
-                let token_id = logits
+                let (token_id, max_logit) = logits
                     .iter()
+                    .copied()
                     .enumerate()
                     .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(self.blank_id);
+                    .unwrap_or((self.blank_id, 0.0));
 
                 if token_id == self.blank_id {
                     break;
                 }
 
+                // Softmax probability of the emitted token.
+                let sum: f32 = logits.iter().map(|&l| (l - max_logit).exp()).sum();
+                self.pending_scores.push(1.0 / sum);
                 tokens.push((token_id, absolute_frame));
                 self.last_token = token_id as i32;
                 self.state_1 = new_state_1;
@@ -490,6 +511,17 @@ impl ParakeetUnified {
 
     fn encoder_frame_to_seconds(frame: usize) -> f32 {
         (frame * SUBSAMPLING_FACTOR * HOP_LENGTH) as f32 / SAMPLE_RATE as f32
+    }
+
+    /// Scores of the last decoded tokens, filtered like `tokens_to_timed`.
+    fn take_scores(&mut self, tokens: &[(usize, usize)]) -> Vec<f32> {
+        let scores = std::mem::take(&mut self.pending_scores);
+        tokens
+            .iter()
+            .zip(scores)
+            .filter(|((id, _), _)| *id < self.blank_id)
+            .map(|(_, s)| s)
+            .collect()
     }
 
     fn tokens_to_timed(&self, tokens: &[(usize, usize)]) -> Vec<TimedToken> {
@@ -535,6 +567,7 @@ impl ParakeetUnified {
         let tokens = self.decode_encoder_frames(&encoded, 0, frame_count, 0)?;
         self.accumulated_tokens = tokens.iter().map(|(id, _)| *id).collect();
         self.accumulated_timed_tokens = self.tokens_to_timed(&tokens);
+        self.accumulated_token_scores = self.take_scores(&tokens);
 
         let text = self.get_transcript();
         let timed = match mode {
