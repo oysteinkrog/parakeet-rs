@@ -10,6 +10,7 @@ use crate::transcriber::Transcriber;
 use ndarray::Array3;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const SAMPLE_RATE: usize = 16000;
 const FEATURE_SIZE: usize = 128;
@@ -21,6 +22,221 @@ const DECODER_LSTM_DIM: usize = 640;
 const DECODER_LSTM_LAYERS: usize = 2;
 const SUBSAMPLING_FACTOR: usize = 8;
 const MAX_SYMBOLS_PER_STEP: usize = 10;
+const TSALLIS_ALPHA: f64 = 0.33;
+
+/// Number of most likely tokens kept per decoder call in [`TokenDetail::top`].
+pub const TOKEN_DETAIL_TOP_K: usize = 5;
+/// Number of non-blank candidates kept per blank frame in [`FrameSignal::top`].
+pub const FRAME_SIGNAL_TOP_K: usize = 3;
+
+/// A summary of the joint network's distribution at one decoder call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TokenDetail {
+    /// The most likely tokens, most likely first, as (token id, natural log
+    /// probability). The blank id can appear here.
+    pub top: [(usize, f32); TOKEN_DETAIL_TOP_K],
+    /// Natural log probability of blank.
+    pub logp_blank: f32,
+    /// Shannon entropy in nats.
+    pub entropy: f32,
+    /// NeMo's `entropy_tsallis_exp` confidence with alpha 0.33: 1 for a
+    /// one-hot distribution, 0 for a uniform one.
+    pub tsallis_confidence: f32,
+    /// Probability of the most likely token minus that of the second.
+    pub margin: f32,
+}
+
+/// The decoder call that ended one encoder frame by emitting blank.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameSignal {
+    /// Encoder frame from the start of the stream (80 ms per frame).
+    pub abs_frame: usize,
+    /// log10(1 - P(blank)) at that call: how close the frame came to a token.
+    pub log10_nonblank: f32,
+    /// The most likely non-blank tokens, most likely first, as (token id,
+    /// natural log probability in the full distribution).
+    pub top: [(usize, f32); FRAME_SIGNAL_TOP_K],
+}
+
+/// A token decoded from the right-context frames of the last step. It is
+/// never committed and is replaced by the next step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TentativeToken {
+    pub id: usize,
+    pub text: String,
+    /// Encoder frame from the start of the stream.
+    pub abs_frame: usize,
+    /// Encoder frames between this token's frame and the right edge of the
+    /// encoded window; 0 for the last frame.
+    pub frames_to_edge: usize,
+    /// The model's probability for this token, like `token_confidences`.
+    pub confidence: f32,
+    pub detail: TokenDetail,
+}
+
+/// Time and decoder calls spent on the last streaming step.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StepStats {
+    /// Feature extraction and the encoder run.
+    pub encoder: Duration,
+    /// Greedy decode of the chunk frames, signals included.
+    pub decode: Duration,
+    /// Part of `decode` and `tentative` spent computing the signals.
+    pub signals: Duration,
+    /// Greedy decode of the right-context frames, signals included.
+    pub tentative: Duration,
+    pub joint_calls: usize,
+    pub tentative_joint_calls: usize,
+}
+
+/// Everything one call to `greedy_decode` produced.
+#[derive(Default)]
+struct Decoded {
+    /// (token id, absolute encoder frame) of each emitted token.
+    tokens: Vec<(usize, usize)>,
+    scores: Vec<f32>,
+    details: Vec<TokenDetail>,
+    frames: Vec<FrameSignal>,
+    joint_calls: usize,
+    signal_time: Duration,
+}
+
+/// One pass over the logits: log-softmax summaries for `TokenDetail` and
+/// `FrameSignal`. Sums run in f64 so that 1 - P(blank) keeps its precision
+/// when blank is nearly certain.
+fn summarize_logits(logits: &[f32], blank_id: usize) -> (TokenDetail, FrameSignal) {
+    fn insert<const K: usize>(top: &mut [(usize, f64); K], id: usize, value: f64) {
+        if value <= top[K - 1].1 {
+            return;
+        }
+        let mut i = K - 1;
+        while i > 0 && value > top[i - 1].1 {
+            top[i] = top[i - 1];
+            i -= 1;
+        }
+        top[i] = (id, value);
+    }
+
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let mut sum = 0.0f64;
+    let mut nonblank_sum = 0.0f64;
+    for (i, &l) in logits.iter().enumerate() {
+        let e = (l as f64 - max).exp();
+        sum += e;
+        if i != blank_id {
+            nonblank_sum += e;
+        }
+    }
+    let log_sum = sum.ln();
+
+    let mut top = [(0usize, f64::NEG_INFINITY); TOKEN_DETAIL_TOP_K];
+    let mut top_nonblank = [(0usize, f64::NEG_INFINITY); FRAME_SIGNAL_TOP_K];
+    let mut entropy = 0.0f64;
+    let mut alpha_sum = 0.0f64;
+    for (i, &l) in logits.iter().enumerate() {
+        let logp = l as f64 - max - log_sum;
+        let p = logp.exp();
+        if p > 0.0 {
+            entropy -= p * logp;
+        }
+        alpha_sum += (TSALLIS_ALPHA * logp).exp();
+        insert(&mut top, i, logp);
+        if i != blank_id {
+            insert(&mut top_nonblank, i, logp);
+        }
+    }
+
+    // NeMo asr_confidence_utils: entropy_tsallis_exp(x, v, t)
+    let v = logits.len() as f64;
+    let exp_neg_max_ent = ((1.0 - v.powf(1.0 - TSALLIS_ALPHA)) / (1.0 - TSALLIS_ALPHA)).exp();
+    let tsallis_confidence = (((1.0 - alpha_sum) / (1.0 - TSALLIS_ALPHA)).exp() - exp_neg_max_ent)
+        / (1.0 - exp_neg_max_ent);
+
+    let logp_blank = logits
+        .get(blank_id)
+        .map_or(f64::NEG_INFINITY, |&l| l as f64 - max - log_sum);
+    let detail = TokenDetail {
+        top: top.map(|(id, lp)| (id, lp as f32)),
+        logp_blank: logp_blank as f32,
+        entropy: entropy as f32,
+        tsallis_confidence: tsallis_confidence as f32,
+        margin: (top[0].1.exp() - top[1].1.exp()) as f32,
+    };
+    let frame = FrameSignal {
+        abs_frame: 0,
+        log10_nonblank: (nonblank_sum / sum).log10() as f32,
+        top: top_nonblank.map(|(id, lp)| (id, lp as f32)),
+    };
+    (detail, frame)
+}
+
+/// Greedy RNN-T decode of `start_frame..end_frame`, advancing the given
+/// decoder state. The token choice is the argmax of the joint logits; the
+/// signals are read off the same logits and never change it.
+#[allow(clippy::too_many_arguments)]
+fn greedy_decode(
+    model: &mut ParakeetUnifiedModel,
+    blank_id: usize,
+    encoder_out: &Array3<f32>,
+    start_frame: usize,
+    end_frame: usize,
+    absolute_frame_offset: usize,
+    state_1: &mut Array3<f32>,
+    state_2: &mut Array3<f32>,
+    last_token: &mut i32,
+) -> Result<Decoded> {
+    let mut out = Decoded::default();
+    let hidden_dim = encoder_out.shape()[1];
+    let end_frame = end_frame.min(encoder_out.shape()[2]);
+
+    for frame_idx in start_frame..end_frame {
+        let frame = encoder_out
+            .slice(ndarray::s![0, .., frame_idx])
+            .to_owned()
+            .to_shape((1, hidden_dim, 1))
+            .map_err(|e| Error::Model(format!("Failed to reshape encoder frame: {e}")))?
+            .to_owned();
+
+        let absolute_frame = absolute_frame_offset + (frame_idx - start_frame);
+
+        for _ in 0..MAX_SYMBOLS_PER_STEP {
+            let (logits, new_state_1, new_state_2) =
+                model.run_decoder(&frame, *last_token, state_1, state_2)?;
+            out.joint_calls += 1;
+
+            let (token_id, max_logit) = logits
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((blank_id, 0.0));
+
+            let signal_start = Instant::now();
+            let (detail, mut frame_signal) = match logits.as_slice() {
+                Some(slice) => summarize_logits(slice, blank_id),
+                None => summarize_logits(&logits.to_vec(), blank_id),
+            };
+            out.signal_time += signal_start.elapsed();
+
+            if token_id == blank_id {
+                frame_signal.abs_frame = absolute_frame;
+                out.frames.push(frame_signal);
+                break;
+            }
+
+            // Softmax probability of the emitted token.
+            let sum: f32 = logits.iter().map(|&l| (l - max_logit).exp()).sum();
+            out.scores.push(1.0 / sum);
+            out.details.push(detail);
+            out.tokens.push((token_id, absolute_frame));
+            *last_token = token_id as i32;
+            *state_1 = new_state_1;
+            *state_2 = new_state_2;
+        }
+    }
+
+    Ok(out)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct UnifiedStreamingConfig {
@@ -143,6 +359,15 @@ pub struct ParakeetUnified {
     accumulated_token_scores: Vec<f32>,
     /// Scores of the tokens from the last `decode_encoder_frames` call.
     pending_scores: Vec<f32>,
+    /// Distribution summary of each token in `accumulated_timed_tokens`.
+    accumulated_token_details: Vec<TokenDetail>,
+    /// Details of the tokens from the last `decode_encoder_frames` call.
+    pending_details: Vec<TokenDetail>,
+    /// One entry per committed encoder frame that ended in blank.
+    frame_signals: Vec<FrameSignal>,
+    tentative_enabled: bool,
+    tentative: Vec<TentativeToken>,
+    last_step_stats: StepStats,
 }
 
 impl ParakeetUnifiedHandle {
@@ -248,6 +473,12 @@ impl ParakeetUnified {
             accumulated_timed_tokens: Vec::new(),
             accumulated_token_scores: Vec::new(),
             pending_scores: Vec::new(),
+            accumulated_token_details: Vec::new(),
+            pending_details: Vec::new(),
+            frame_signals: Vec::new(),
+            tentative_enabled: true,
+            tentative: Vec::new(),
+            last_step_stats: StepStats::default(),
         })
     }
 
@@ -269,6 +500,10 @@ impl ParakeetUnified {
         self.accumulated_tokens.clear();
         self.accumulated_timed_tokens.clear();
         self.accumulated_token_scores.clear();
+        self.accumulated_token_details.clear();
+        self.frame_signals.clear();
+        self.tentative.clear();
+        self.last_step_stats = StepStats::default();
     }
 
     pub fn get_timed_transcript(&self, mode: TimestampMode) -> TranscriptionResult {
@@ -282,6 +517,53 @@ impl ParakeetUnified {
     /// for the emitted token, 0 to 1.
     pub fn token_confidences(&self) -> &[f32] {
         &self.accumulated_token_scores
+    }
+
+    /// Distribution summary of each token returned by `get_timed_transcript`
+    /// in `TimestampMode::Tokens`, in the same order as `token_confidences`.
+    pub fn token_details(&self) -> &[TokenDetail] {
+        &self.accumulated_token_details
+    }
+
+    /// One entry per committed encoder frame, in order, taken from the decoder
+    /// call that emitted blank to end the frame. A frame that hit the
+    /// per-frame symbol limit has no entry.
+    pub fn frame_signals(&self) -> &[FrameSignal] {
+        &self.frame_signals
+    }
+
+    /// Tokens decoded from the right-context frames of the last streaming
+    /// step, from a copy of the decoder state. They are never committed: the
+    /// next step replaces them, and the committed tokens are the same whether
+    /// or not this runs.
+    pub fn tentative(&self) -> &[TentativeToken] {
+        &self.tentative
+    }
+
+    /// The committed transcript followed by the tentative tokens.
+    pub fn transcript_with_tentative(&self) -> String {
+        let valid: Vec<usize> = self
+            .accumulated_tokens
+            .iter()
+            .copied()
+            .filter(|&token| token < self.blank_id)
+            .chain(self.tentative.iter().map(|t| t.id))
+            .collect();
+        self.vocab.decode(&valid)
+    }
+
+    /// Decode the right-context frames each step (on by default). Off saves
+    /// the extra decoder calls and leaves `tentative` empty.
+    pub fn set_tentative_enabled(&mut self, enabled: bool) {
+        self.tentative_enabled = enabled;
+        if !enabled {
+            self.tentative.clear();
+        }
+    }
+
+    /// Time and decoder calls of the last streaming step.
+    pub fn last_step_stats(&self) -> StepStats {
+        self.last_step_stats
     }
 
     pub fn get_transcript(&self) -> String {
@@ -342,6 +624,7 @@ impl ParakeetUnified {
                 break;
             }
 
+            let encoder_start = Instant::now();
             let features = audio::extract_features_raw(
                 window_audio,
                 SAMPLE_RATE as u32,
@@ -359,8 +642,11 @@ impl ParakeetUnified {
             let start_frame = left_encoder_frames.min(available_frames);
             let end_frame = (start_frame + chunk_encoder_frames).min(available_frames);
 
+            let encoder_time = encoder_start.elapsed();
+
             let absolute_frame_offset =
                 self.next_chunk_start_sample / (HOP_LENGTH * SUBSAMPLING_FACTOR);
+            let decode_start = Instant::now();
             let tokens =
                 self.decode_encoder_frames(&encoded, start_frame, end_frame, absolute_frame_offset)?;
             self.accumulated_tokens
@@ -369,7 +655,14 @@ impl ParakeetUnified {
                 .extend(self.tokens_to_timed(&tokens));
             let scores = self.take_scores(&tokens);
             self.accumulated_token_scores.extend(scores);
+            let details = self.take_details(&tokens);
+            self.accumulated_token_details.extend(details);
             emitted.push_str(&self.decode_incremental_tokens(&tokens));
+            self.last_step_stats.encoder = encoder_time;
+            self.last_step_stats.decode = decode_start.elapsed();
+
+            let tentative_offset = absolute_frame_offset + (end_frame - start_frame);
+            self.decode_tentative(&encoded, end_frame, available_frames, tentative_offset)?;
 
             self.next_chunk_start_sample += chunk_samples;
             self.trim_audio_buffer();
@@ -456,57 +749,91 @@ impl ParakeetUnified {
         end_frame: usize,
         absolute_frame_offset: usize,
     ) -> Result<Vec<(usize, usize)>> {
-        let mut tokens = Vec::new();
-        self.pending_scores.clear();
-        let hidden_dim = encoder_out.shape()[1];
-        let end_frame = end_frame.min(encoder_out.shape()[2]);
-
         // Hold the lock once across the decoder loop to avoid per-step acquire/release.
         let mut model = self
             .model
             .lock()
             .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
 
-        for frame_idx in start_frame..end_frame {
-            let frame = encoder_out
-                .slice(ndarray::s![0, .., frame_idx])
-                .to_owned()
-                .to_shape((1, hidden_dim, 1))
-                .map_err(|e| Error::Model(format!("Failed to reshape encoder frame: {e}")))?
-                .to_owned();
+        let decoded = greedy_decode(
+            &mut model,
+            self.blank_id,
+            encoder_out,
+            start_frame,
+            end_frame,
+            absolute_frame_offset,
+            &mut self.state_1,
+            &mut self.state_2,
+            &mut self.last_token,
+        )?;
+        self.pending_scores = decoded.scores;
+        self.pending_details = decoded.details;
+        self.frame_signals.extend(decoded.frames);
+        self.last_step_stats.joint_calls = decoded.joint_calls;
+        self.last_step_stats.signals = decoded.signal_time;
+        Ok(decoded.tokens)
+    }
 
-            let absolute_frame = absolute_frame_offset + (frame_idx - start_frame);
-
-            for _ in 0..MAX_SYMBOLS_PER_STEP {
-                let (logits, new_state_1, new_state_2) = model.run_decoder(
-                    &frame,
-                    self.last_token,
-                    &self.state_1,
-                    &self.state_2,
-                )?;
-
-                let (token_id, max_logit) = logits
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .unwrap_or((self.blank_id, 0.0));
-
-                if token_id == self.blank_id {
-                    break;
-                }
-
-                // Softmax probability of the emitted token.
-                let sum: f32 = logits.iter().map(|&l| (l - max_logit).exp()).sum();
-                self.pending_scores.push(1.0 / sum);
-                tokens.push((token_id, absolute_frame));
-                self.last_token = token_id as i32;
-                self.state_1 = new_state_1;
-                self.state_2 = new_state_2;
-            }
+    /// Greedy decode of the right-context frames from a copy of the decoder
+    /// state, into `self.tentative`. The committed state is not touched.
+    fn decode_tentative(
+        &mut self,
+        encoder_out: &Array3<f32>,
+        start_frame: usize,
+        available_frames: usize,
+        absolute_frame_offset: usize,
+    ) -> Result<()> {
+        self.tentative.clear();
+        self.last_step_stats.tentative = Duration::ZERO;
+        self.last_step_stats.tentative_joint_calls = 0;
+        if !self.tentative_enabled || start_frame >= available_frames {
+            return Ok(());
         }
 
-        Ok(tokens)
+        let tentative_start = Instant::now();
+        let mut state_1 = self.state_1.clone();
+        let mut state_2 = self.state_2.clone();
+        let mut last_token = self.last_token;
+        let decoded = {
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
+            greedy_decode(
+                &mut model,
+                self.blank_id,
+                encoder_out,
+                start_frame,
+                available_frames,
+                absolute_frame_offset,
+                &mut state_1,
+                &mut state_2,
+                &mut last_token,
+            )?
+        };
+
+        let edge = available_frames.min(encoder_out.shape()[2]);
+        self.tentative = decoded
+            .tokens
+            .iter()
+            .zip(decoded.scores)
+            .zip(decoded.details)
+            .map(|((&(id, abs_frame), confidence), detail)| {
+                let frame_idx = start_frame + (abs_frame - absolute_frame_offset);
+                TentativeToken {
+                    id,
+                    text: self.vocab.decode_single(id),
+                    abs_frame,
+                    frames_to_edge: edge.saturating_sub(frame_idx + 1),
+                    confidence,
+                    detail,
+                }
+            })
+            .collect();
+        self.last_step_stats.tentative = tentative_start.elapsed();
+        self.last_step_stats.tentative_joint_calls = decoded.joint_calls;
+        self.last_step_stats.signals += decoded.signal_time;
+        Ok(())
     }
 
     fn encoder_frame_to_seconds(frame: usize) -> f32 {
@@ -521,6 +848,17 @@ impl ParakeetUnified {
             .zip(scores)
             .filter(|((id, _), _)| *id < self.blank_id)
             .map(|(_, s)| s)
+            .collect()
+    }
+
+    /// Details of the last decoded tokens, filtered like `tokens_to_timed`.
+    fn take_details(&mut self, tokens: &[(usize, usize)]) -> Vec<TokenDetail> {
+        let details = std::mem::take(&mut self.pending_details);
+        tokens
+            .iter()
+            .zip(details)
+            .filter(|((id, _), _)| *id < self.blank_id)
+            .map(|(_, d)| d)
             .collect()
     }
 
@@ -568,6 +906,7 @@ impl ParakeetUnified {
         self.accumulated_tokens = tokens.iter().map(|(id, _)| *id).collect();
         self.accumulated_timed_tokens = self.tokens_to_timed(&tokens);
         self.accumulated_token_scores = self.take_scores(&tokens);
+        self.accumulated_token_details = self.take_details(&tokens);
 
         let text = self.get_transcript();
         let timed = match mode {
@@ -596,7 +935,64 @@ impl Transcriber for ParakeetUnified {
 
 #[cfg(test)]
 mod tests {
-    use super::UnifiedStreamingConfig;
+    use super::{summarize_logits, UnifiedStreamingConfig};
+
+    const BLANK: usize = 1024;
+
+    fn logits(blank_logit: f32) -> Vec<f32> {
+        let mut l: Vec<f32> = (0..=BLANK)
+            .map(|i| ((i as f64 * 0.37).sin() * 3.0) as f32)
+            .collect();
+        l[BLANK] = blank_logit;
+        l
+    }
+
+    fn close(a: f32, b: f64, tol: f64) {
+        assert!((a as f64 - b).abs() < tol, "{a} vs {b}");
+    }
+
+    // Expected values come from the formulas in probe_stream.py (float64 numpy
+    // softmax of the same f32 logits) and NeMo's entropy_tsallis_exp.
+    #[test]
+    fn signals_match_reference_when_blank_is_nearly_certain() {
+        let (detail, frame) = summarize_logits(&logits(14.0), BLANK);
+        close(frame.log10_nonblank, -2.381127631313727, 1e-5);
+        close(detail.logp_blank, -0.004166552033409276, 1e-6);
+        close(detail.entropy, 0.05226803183753447, 1e-6);
+        close(detail.margin, 0.9958254838676014, 1e-6);
+        close(detail.tsallis_confidence, 5.594661568947102e-09, 1e-10);
+        let top: Vec<usize> = detail.top.iter().map(|t| t.0).collect();
+        assert_eq!(top, [1024, 225, 242, 208, 259]);
+        close(detail.top[1].1, -11.004173943009361, 1e-5);
+        let nb: Vec<usize> = frame.top.iter().map(|t| t.0).collect();
+        assert_eq!(nb, [225, 242, 208]);
+        close(frame.top[2].1, -11.004288622345909, 1e-5);
+    }
+
+    #[test]
+    fn signals_match_reference_when_blank_is_unlikely() {
+        let (detail, frame) = summarize_logits(&logits(2.5), BLANK);
+        close(frame.log10_nonblank, -0.0010524211645798337, 1e-6);
+        close(detail.logp_blank, -6.0238408529392995, 1e-5);
+        close(detail.entropy, 6.092414688349319, 1e-5);
+        close(detail.margin, 9.799302771833218e-08, 1e-7);
+        let top: Vec<usize> = detail.top.iter().map(|t| t.0).collect();
+        assert_eq!(top, [225, 242, 208, 259, 191]);
+        close(detail.top[0].1, -5.523848243915252, 1e-5);
+    }
+
+    #[test]
+    fn tsallis_confidence_spans_zero_to_one() {
+        let (uniform, _) = summarize_logits(&[0.0; BLANK + 1], BLANK);
+        close(uniform.tsallis_confidence, 0.0, 1e-6);
+        let mut peaked = vec![-100.0f32; BLANK + 1];
+        peaked[7] = 100.0;
+        let (peaked, frame) = summarize_logits(&peaked, BLANK);
+        close(peaked.tsallis_confidence, 1.0, 1e-6);
+        assert_eq!(peaked.top[0].0, 7);
+        assert_eq!(frame.top[0].0, 7);
+        close(frame.log10_nonblank, 0.0, 1e-6);
+    }
 
     #[test]
     fn default_streaming_profile_aligns_to_subsampling() {
