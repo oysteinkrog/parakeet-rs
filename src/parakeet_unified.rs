@@ -368,6 +368,8 @@ pub struct ParakeetUnified {
     tentative_enabled: bool,
     tentative: Vec<TentativeToken>,
     last_step_stats: StepStats,
+    /// Time spent on the last `decode_tail`: `encoder` and `tentative`.
+    last_tail_stats: StepStats,
 }
 
 impl ParakeetUnifiedHandle {
@@ -478,6 +480,7 @@ impl ParakeetUnified {
             frame_signals: Vec::new(),
             tentative_enabled: true,
             tentative: Vec::new(),
+            last_tail_stats: StepStats::default(),
             last_step_stats: StepStats::default(),
         })
     }
@@ -564,6 +567,70 @@ impl ParakeetUnified {
     /// Time and decoder calls of the last streaming step.
     pub fn last_step_stats(&self) -> StepStats {
         self.last_step_stats
+    }
+
+    /// Time of the last `decode_tail`: the encoder run and the tentative
+    /// decode.
+    pub fn last_tail_stats(&self) -> StepStats {
+        self.last_tail_stats
+    }
+
+    /// Samples of the stream the committed transcript covers: where the
+    /// next streaming step starts.
+    pub fn committed_samples(&self) -> usize {
+        self.next_chunk_start_sample
+    }
+
+    /// Decode a new tentative tail from all the audio received after the
+    /// committed part, between two streaming steps: one encoder pass over the
+    /// window that ends at the newest sample and a greedy decode of every
+    /// frame after the committed ones, from a copy of the decoder state.
+    /// Replaces `tentative`. The committed state is not touched, so the
+    /// committed tokens are the same whether or not this runs. Returns false
+    /// when tentative decoding is off or no audio is past the committed part.
+    pub fn decode_tail(&mut self) -> Result<bool> {
+        let total_received = self.buffer_start_sample + self.audio_buffer.len();
+        if !self.tentative_enabled || total_received <= self.next_chunk_start_sample {
+            return Ok(false);
+        }
+        let start = self.next_chunk_start_sample;
+        // As a flush builds it: the window ends at the newest sample, with no
+        // padding after it.
+        let (window_audio, left_encoder_frames, chunk_encoder_frames) =
+            self.build_window_audio(start, total_received, true);
+        if chunk_encoder_frames == 0 {
+            return Ok(false);
+        }
+        let encoder_start = Instant::now();
+        let features = audio::extract_features_raw(
+            window_audio,
+            SAMPLE_RATE as u32,
+            1,
+            &self.preprocessor_config,
+        )?;
+        let (encoded, encoded_len) = {
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
+            model.run_encoder(&features)?
+        };
+        let encoder = encoder_start.elapsed();
+        let available_frames = (encoded_len as usize).min(encoded.shape()[2]);
+        let start_frame = left_encoder_frames.min(available_frames);
+        let absolute_frame_offset = start / (HOP_LENGTH * SUBSAMPLING_FACTOR);
+        // decode_tentative writes its time into the step stats; keep those
+        // for the step and take the tail's own.
+        let step = self.last_step_stats;
+        self.decode_tentative(&encoded, start_frame, available_frames, absolute_frame_offset)?;
+        self.last_tail_stats = StepStats {
+            encoder,
+            tentative: self.last_step_stats.tentative,
+            tentative_joint_calls: self.last_step_stats.tentative_joint_calls,
+            ..StepStats::default()
+        };
+        self.last_step_stats = step;
+        Ok(true)
     }
 
     pub fn get_transcript(&self) -> String {
