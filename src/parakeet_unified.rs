@@ -79,14 +79,12 @@ pub struct TentativeToken {
 /// step committed, then the lookahead frames after them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayerFrames {
-    /// Counts encoder runs that produced frames, from 1, so a caller can
-    /// tell a new set from the one it already has.
+    /// The encoder run that produced the newest frames, counted from 1.
     pub run: u64,
     /// Encoder frame from the start of the stream of the first row.
     pub first_frame: usize,
-    /// The first `committed` rows are the frames this step committed; the
-    /// rest are lookahead frames, encoded again by the next run. 0 for a
-    /// `decode_tail` run.
+    /// The first `committed` rows are committed frames; the rest are the
+    /// newest run's lookahead frames, encoded again by the next run.
     pub committed: usize,
     /// One row per encoder frame (80 ms), in order.
     pub frames: Array2<f32>,
@@ -389,6 +387,7 @@ pub struct ParakeetUnified {
     /// Time spent on the last `decode_tail`: `encoder` and `tentative`.
     last_tail_stats: StepStats,
     layer_frames: Option<LayerFrames>,
+    layer_runs: u64,
 }
 
 impl ParakeetUnifiedHandle {
@@ -512,6 +511,7 @@ impl ParakeetUnified {
             last_tail_stats: StepStats::default(),
             last_step_stats: StepStats::default(),
             layer_frames: None,
+            layer_runs: 0,
         })
     }
 
@@ -600,11 +600,17 @@ impl ParakeetUnified {
         self.last_step_stats
     }
 
-    /// The inner layer's frames from the last encoder run of a streaming
-    /// step or `decode_tail`, when the model was loaded with
-    /// [`ParakeetUnifiedHandle::load_with_layer`].
+    /// The inner layer's frames since the last `take_layer_frames`, when
+    /// the model was loaded with [`ParakeetUnifiedHandle::load_with_layer`]:
+    /// every frame committed since then (one `transcribe_chunk` or `flush`
+    /// can run several steps), then the newest run's lookahead frames.
     pub fn layer_frames(&self) -> Option<&LayerFrames> {
         self.layer_frames.as_ref()
+    }
+
+    /// `layer_frames`, handed over: the next run starts a new set.
+    pub fn take_layer_frames(&mut self) -> Option<LayerFrames> {
+        self.layer_frames.take()
     }
 
     /// Time of the last `decode_tail`: the encoder run and the tentative
@@ -817,12 +823,29 @@ impl ParakeetUnified {
         let Some(layer) = layer else { return };
         let available = available.min(layer.nrows());
         let start = start.min(available);
-        let run = self.layer_frames.as_ref().map_or(0, |l| l.run) + 1;
+        let rows = layer.slice(ndarray::s![start..available, ..]);
+        let committed = end.min(available) - start;
+        let run = self.layer_runs + 1;
+        self.layer_runs = run;
+        // Committed rows nobody has taken yet stay in front, when this run
+        // carries on from them.
+        let held = self
+            .layer_frames
+            .take()
+            .filter(|l| l.first_frame + l.committed == absolute_frame_offset && l.committed > 0);
+        let merged = held.and_then(|l| {
+            let kept = l.frames.slice(ndarray::s![..l.committed, ..]);
+            ndarray::concatenate(ndarray::Axis(0), &[kept, rows])
+                .ok()
+                .map(|frames| (l.first_frame, l.committed, frames))
+        });
+        let (first_frame, before, frames) =
+            merged.unwrap_or_else(|| (absolute_frame_offset, 0, rows.to_owned()));
         self.layer_frames = Some(LayerFrames {
             run,
-            first_frame: absolute_frame_offset,
-            committed: end.min(available) - start,
-            frames: layer.slice(ndarray::s![start..available, ..]).to_owned(),
+            first_frame,
+            committed: before + committed,
+            frames,
         });
     }
 
