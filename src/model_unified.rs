@@ -28,6 +28,8 @@ impl Default for UnifiedModelConfig {
 pub struct ParakeetUnifiedModel {
     encoder: Session,
     decoder_joint: Session,
+    /// A second encoder output to read each run: one inner layer's frames.
+    layer_output: Option<String>,
     pub config: UnifiedModelConfig,
 }
 
@@ -37,8 +39,24 @@ impl ParakeetUnifiedModel {
         exec_config: ExecutionConfig,
         config: UnifiedModelConfig,
     ) -> Result<Self> {
+        Self::from_pretrained_with_layer(model_dir, None, exec_config, config)
+    }
+
+    /// Like `from_pretrained`, but with `layer` = (encoder file, output
+    /// name) the encoder is loaded from that file and `run_encoder_with_layer`
+    /// also returns that output: an encoder exported with one inner layer as
+    /// an extra graph output.
+    pub fn from_pretrained_with_layer<P: AsRef<Path>>(
+        model_dir: P,
+        layer: Option<(&Path, &str)>,
+        exec_config: ExecutionConfig,
+        config: UnifiedModelConfig,
+    ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
-        let encoder_path = Self::find_encoder(model_dir)?;
+        let encoder_path = match layer {
+            Some((path, _)) => path.to_path_buf(),
+            None => Self::find_encoder(model_dir)?,
+        };
         let decoder_joint_path = Self::find_decoder_joint(model_dir)?;
 
         let builder = Session::builder()?;
@@ -52,6 +70,7 @@ impl ParakeetUnifiedModel {
         Ok(Self {
             encoder,
             decoder_joint,
+            layer_output: layer.map(|(_, name)| name.to_string()),
             config,
         })
     }
@@ -91,6 +110,17 @@ impl ParakeetUnifiedModel {
     }
 
     pub fn run_encoder(&mut self, features: &Array2<f32>) -> Result<(Array3<f32>, i64)> {
+        self.run_encoder_with_layer(features)
+            .map(|(encoded, len, _)| (encoded, len))
+    }
+
+    /// `run_encoder`, plus the inner layer's frames as (time, dim) when the
+    /// model was loaded with one (`from_pretrained_with_layer`).
+    #[allow(clippy::type_complexity)]
+    pub fn run_encoder_with_layer(
+        &mut self,
+        features: &Array2<f32>,
+    ) -> Result<(Array3<f32>, i64, Option<Array2<f32>>)> {
         let time_steps = features.shape()[0];
         let feature_size = features.shape()[1];
 
@@ -128,7 +158,32 @@ impl ParakeetUnifiedModel {
         )
         .map_err(|e| Error::Model(format!("Failed to create encoder array: {e}")))?;
 
-        Ok((encoder_out, lens_data[0]))
+        let layer = match &self.layer_output {
+            None => None,
+            Some(name) => {
+                let (shape, data) = outputs[name.as_str()]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| Error::Model(format!("Failed to extract {name}: {e}")))?;
+                let d = shape.as_ref();
+                if d.len() != 3 || d[0] != 1 {
+                    return Err(Error::Model(format!(
+                        "Expected (1, time, dim) from {name}, got shape: {d:?}"
+                    )));
+                }
+                let (a, b) = (d[1] as usize, d[2] as usize);
+                let raw = Array2::from_shape_vec((a, b), data.to_vec())
+                    .map_err(|e| Error::Model(format!("Failed to create layer array: {e}")))?;
+                // (1, time, dim) from a layer norm; (1, dim, time) when the
+                // output sits after a transpose.
+                Some(if a == dims[2] as usize || b != dims[2] as usize {
+                    raw
+                } else {
+                    raw.t().to_owned()
+                })
+            }
+        };
+
+        Ok((encoder_out, lens_data[0], layer))
     }
 
     pub fn run_decoder(

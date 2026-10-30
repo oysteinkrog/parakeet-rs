@@ -7,7 +7,7 @@ use crate::model_unified::{ParakeetUnifiedModel, UnifiedModelConfig};
 use crate::nemotron::SentencePieceVocab;
 use crate::timestamps::{process_timestamps, TimestampMode};
 use crate::transcriber::Transcriber;
-use ndarray::Array3;
+use ndarray::{Array2, Array3};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -72,6 +72,24 @@ pub struct TentativeToken {
     /// The model's probability for this token, like `token_confidences`.
     pub confidence: f32,
     pub detail: TokenDetail,
+}
+
+/// One inner encoder layer's frames from the last encoder run, for a model
+/// loaded with [`ParakeetUnifiedHandle::load_with_layer`]: the frames the
+/// step committed, then the lookahead frames after them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerFrames {
+    /// Counts encoder runs that produced frames, from 1, so a caller can
+    /// tell a new set from the one it already has.
+    pub run: u64,
+    /// Encoder frame from the start of the stream of the first row.
+    pub first_frame: usize,
+    /// The first `committed` rows are the frames this step committed; the
+    /// rest are lookahead frames, encoded again by the next run. 0 for a
+    /// `decode_tail` run.
+    pub committed: usize,
+    /// One row per encoder frame (80 ms), in order.
+    pub frames: Array2<f32>,
 }
 
 /// Time and decoder calls spent on the last streaming step.
@@ -370,13 +388,23 @@ pub struct ParakeetUnified {
     last_step_stats: StepStats,
     /// Time spent on the last `decode_tail`: `encoder` and `tentative`.
     last_tail_stats: StepStats,
+    layer_frames: Option<LayerFrames>,
 }
 
 impl ParakeetUnifiedHandle {
     /// Load the ParakeetUnified model, vocabulary, and preprocessor config
     /// from a directory.
-    pub fn load<P: AsRef<Path>>(
+    pub fn load<P: AsRef<Path>>(path: P, exec_config: Option<ExecutionConfig>) -> Result<Self> {
+        Self::load_with_layer(path, None, exec_config)
+    }
+
+    /// `load`, with the encoder from `layer.0` instead: one exported with
+    /// the inner layer output `layer.1` as an extra graph output. Each
+    /// streaming step then keeps that layer's frames
+    /// ([`ParakeetUnified::layer_frames`]). Text and signals are unchanged.
+    pub fn load_with_layer<P: AsRef<Path>>(
         path: P,
+        layer: Option<(&Path, &str)>,
         exec_config: Option<ExecutionConfig>,
     ) -> Result<Self> {
         let path = path.as_ref();
@@ -391,8 +419,9 @@ impl ParakeetUnifiedHandle {
             subsampling_factor: SUBSAMPLING_FACTOR,
         };
 
-        let model = ParakeetUnifiedModel::from_pretrained(
+        let model = ParakeetUnifiedModel::from_pretrained_with_layer(
             path,
+            layer,
             exec_config.unwrap_or_default(),
             model_config,
         )?;
@@ -482,6 +511,7 @@ impl ParakeetUnified {
             tentative: Vec::new(),
             last_tail_stats: StepStats::default(),
             last_step_stats: StepStats::default(),
+            layer_frames: None,
         })
     }
 
@@ -507,6 +537,7 @@ impl ParakeetUnified {
         self.frame_signals.clear();
         self.tentative.clear();
         self.last_step_stats = StepStats::default();
+        self.layer_frames = None;
     }
 
     pub fn get_timed_transcript(&self, mode: TimestampMode) -> TranscriptionResult {
@@ -569,6 +600,13 @@ impl ParakeetUnified {
         self.last_step_stats
     }
 
+    /// The inner layer's frames from the last encoder run of a streaming
+    /// step or `decode_tail`, when the model was loaded with
+    /// [`ParakeetUnifiedHandle::load_with_layer`].
+    pub fn layer_frames(&self) -> Option<&LayerFrames> {
+        self.layer_frames.as_ref()
+    }
+
     /// Time of the last `decode_tail`: the encoder run and the tentative
     /// decode.
     pub fn last_tail_stats(&self) -> StepStats {
@@ -608,21 +646,33 @@ impl ParakeetUnified {
             1,
             &self.preprocessor_config,
         )?;
-        let (encoded, encoded_len) = {
+        let (encoded, encoded_len, layer) = {
             let mut model = self
                 .model
                 .lock()
                 .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
-            model.run_encoder(&features)?
+            model.run_encoder_with_layer(&features)?
         };
         let encoder = encoder_start.elapsed();
         let available_frames = (encoded_len as usize).min(encoded.shape()[2]);
         let start_frame = left_encoder_frames.min(available_frames);
         let absolute_frame_offset = start / (HOP_LENGTH * SUBSAMPLING_FACTOR);
+        self.keep_layer_frames(
+            layer,
+            start_frame,
+            start_frame,
+            available_frames,
+            absolute_frame_offset,
+        );
         // decode_tentative writes its time into the step stats; keep those
         // for the step and take the tail's own.
         let step = self.last_step_stats;
-        self.decode_tentative(&encoded, start_frame, available_frames, absolute_frame_offset)?;
+        self.decode_tentative(
+            &encoded,
+            start_frame,
+            available_frames,
+            absolute_frame_offset,
+        )?;
         self.last_tail_stats = StepStats {
             encoder,
             tentative: self.last_step_stats.tentative,
@@ -698,24 +748,36 @@ impl ParakeetUnified {
                 1,
                 &self.preprocessor_config,
             )?;
-            let (encoded, encoded_len) = {
-                let mut model = self.model.lock().map_err(|e| {
-                    Error::Model(format!("Failed to acquire model lock: {e}"))
-                })?;
-                model.run_encoder(&features)?
+            let (encoded, encoded_len, layer) = {
+                let mut model = self
+                    .model
+                    .lock()
+                    .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
+                model.run_encoder_with_layer(&features)?
             };
 
             let available_frames = (encoded_len as usize).min(encoded.shape()[2]);
             let start_frame = left_encoder_frames.min(available_frames);
             let end_frame = (start_frame + chunk_encoder_frames).min(available_frames);
 
-            let encoder_time = encoder_start.elapsed();
-
             let absolute_frame_offset =
                 self.next_chunk_start_sample / (HOP_LENGTH * SUBSAMPLING_FACTOR);
+            self.keep_layer_frames(
+                layer,
+                start_frame,
+                end_frame,
+                available_frames,
+                absolute_frame_offset,
+            );
+
+            let encoder_time = encoder_start.elapsed();
             let decode_start = Instant::now();
-            let tokens =
-                self.decode_encoder_frames(&encoded, start_frame, end_frame, absolute_frame_offset)?;
+            let tokens = self.decode_encoder_frames(
+                &encoded,
+                start_frame,
+                end_frame,
+                absolute_frame_offset,
+            )?;
             self.accumulated_tokens
                 .extend(tokens.iter().map(|(id, _)| *id));
             self.accumulated_timed_tokens
@@ -742,6 +804,28 @@ impl ParakeetUnified {
         Ok(emitted)
     }
 
+    /// Keeps rows `start..available` of an encoder run's layer frames, the
+    /// first `end - start` of them committed by this run.
+    fn keep_layer_frames(
+        &mut self,
+        layer: Option<Array2<f32>>,
+        start: usize,
+        end: usize,
+        available: usize,
+        absolute_frame_offset: usize,
+    ) {
+        let Some(layer) = layer else { return };
+        let available = available.min(layer.nrows());
+        let start = start.min(available);
+        let run = self.layer_frames.as_ref().map_or(0, |l| l.run) + 1;
+        self.layer_frames = Some(LayerFrames {
+            run,
+            first_frame: absolute_frame_offset,
+            committed: end.min(available) - start,
+            frames: layer.slice(ndarray::s![start..available, ..]).to_owned(),
+        });
+    }
+
     fn build_window_audio(
         &self,
         chunk_start_sample: usize,
@@ -754,7 +838,9 @@ impl ParakeetUnified {
 
         let available_left = chunk_start_sample.saturating_sub(self.buffer_start_sample);
         let available_left = available_left.min(left_context_samples);
-        let available_main = total_received.saturating_sub(chunk_start_sample).min(chunk_samples);
+        let available_main = total_received
+            .saturating_sub(chunk_start_sample)
+            .min(chunk_samples);
         let available_right = if flush {
             total_received
                 .saturating_sub(chunk_start_sample + available_main)
@@ -960,7 +1046,8 @@ impl ParakeetUnified {
     ) -> Result<TranscriptionResult> {
         self.reset();
 
-        let features = audio::extract_features_raw(audio, sample_rate, channels, &self.preprocessor_config)?;
+        let features =
+            audio::extract_features_raw(audio, sample_rate, channels, &self.preprocessor_config)?;
         let (encoded, encoded_len) = {
             let mut model = self
                 .model
